@@ -1,9 +1,12 @@
 import os
 import requests
+import threading
+import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from .chunk import ChunkManager
 from .retry import retry, ResumeInfo
+from .progress import ProgressTracker
 
 logger = logging.getLogger(__name__)
 
@@ -13,8 +16,9 @@ class Downloader:
         self.dest = dest or os.path.basename(url)
         self.threads = threads
         self.chunk_size = chunk_size
+        self._progress = None
+        self._lock = threading.Lock()
     
-    @retry(max_attempts=3, delay=1, exceptions=(requests.RequestException,))
     def get_file_size(self):
         resp = requests.head(self.url, allow_redirects=True, timeout=30)
         resp.raise_for_status()
@@ -23,33 +27,41 @@ class Downloader:
             raise ValueError("Server did not provide content-length")
         return size
     
-    @retry(max_attempts=5, delay=0.5, backoff=1.5)
     def download_chunk(self, start, end, dest_fd):
         headers = {"Range": f"bytes={start}-{end}"}
-        try:
-            resp = requests.get(self.url, headers=headers, stream=True, timeout=60)
-        except Exception as e:
-            logger.error(f"Chunk {start}-{end} retrying...")
-            raise
+        resp = requests.get(self.url, headers=headers, stream=True, timeout=60)
         resp.raise_for_status()
-        dest_fd.seek(start)
-        dest_fd.write(resp.content)
-        return len(resp.content)
+        data = resp.content
+        with self._lock:
+            dest_fd.seek(start)
+            dest_fd.write(data)
+        return len(data)
     
     def download(self):
         size = self.get_file_size()
-        logger.info(f"File size: {size} bytes, using {self.threads} threads")
+        logger.info(f"Downloading {self.dest}: {size:,} bytes x {self.threads} threads")
+        
+        self._progress = ProgressTracker(size, os.path.basename(self.dest))
         chunks = ChunkManager(size, self.chunk_size).split()
         
         with open(self.dest, "wb") as f:
             f.truncate(size)
             with ThreadPoolExecutor(max_workers=self.threads) as executor:
-                futures = {
-                    executor.submit(self.download_chunk, s, e, f): (s, e) 
-                    for s, e in chunks
-                }
+                futures = []
+                for start, end in chunks:
+                    futures.append(executor.submit(self.download_chunk, start, end, f))
+                
                 for future in as_completed(futures):
-                    future.result()
+                    try:
+                        written = future.result()
+                        self._progress.update(written)
+                    except Exception as e:
+                        logger.error(f"Chunk failed: {e}")
+                        raise
+        
+        elapsed = self._progress.close()
+        speed = size / elapsed / 1024 / 1024
+        logger.info(f"Done in {elapsed:.1f}s ({speed:.1f} MB/s)")
     
-    def shutdown(self):
-        pass
+    def cancel(self):
+        logger.info("Download cancelled")
